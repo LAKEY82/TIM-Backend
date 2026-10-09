@@ -320,6 +320,126 @@ describe("tasks", () => {
       expect((await pm.post(`/api/tasks/${task.id}/approve`)).body.data.status).toBe("IN_QA");
     });
 
+    it("bugs get a fix-by date from QA, which QA and the PM can change but the developer can't", async () => {
+      const task = await readyForReview();
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      const qa = await login(app, "outsider@t.test");
+      const logged = await qa.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Coupon ignored", dueDate: "2026-11-02" }] });
+      expect(logged.status).toBe(200);
+      const bugId = logged.body.data.bugIds[0] as string;
+      expect(logged.body.data.subtasks[0].dueDate).toBe("2026-11-02");
+
+      // QA moves the date (not the plan); the developer is told.
+      expect((await qa.patch(`/api/tasks/${bugId}`, { dueDate: "2026-11-05" })).body.data.dueDate).toBe("2026-11-05");
+      expect((await qa.patch(`/api/tasks/${bugId}`, { estimatedHours: 4 })).status).toBe(403);
+      expect(await Notification.findOne({ recipient: fx.emp, type: "DEADLINE_APPROACHING", title: /Fix Coupon ignored by 2026-11-05/ })).toBeTruthy();
+
+      // The PM can change it too; the developer can't.
+      expect((await pm.patch(`/api/tasks/${bugId}`, { dueDate: "2026-11-04" })).status).toBe(200);
+      expect((await emp.patch(`/api/tasks/${bugId}`, { dueDate: "2026-12-01" })).status).toBe(403);
+
+      // QA can't use this to edit regular tasks.
+      expect((await qa.patch(`/api/tasks/${task.id}`, { dueDate: "2026-11-05" })).status).toBe(403);
+    });
+
+    it("My bugs: QA lists the bugs they test and edits the report, priority and date, but not the developer or status", async () => {
+      const task = await readyForReview();
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      const qa = await login(app, "outsider@t.test");
+      expect((await qa.get("/api/auth/me")).body.data.isQaTester).toBe(true);
+      expect((await emp.get("/api/auth/me")).body.data.isQaTester).toBe(false);
+
+      const logged = await qa.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ kind: "UI", title: "Header overlaps logo", steps: "Open on mobile" }] });
+      const bugId = logged.body.data.bugIds[0] as string;
+
+      const list = await qa.get("/api/tasks?qaBugs=true");
+      expect(list.body.data).toEqual([
+        expect.objectContaining({ id: bugId, issueKind: "UI", parent: expect.objectContaining({ id: task.id }), assignee: expect.objectContaining({ id: String(fx.emp) }) }),
+      ]);
+      // Regular tasks (and other people's bugs) aren't in it.
+      expect((await emp.get("/api/tasks?qaBugs=true")).body.data).toEqual([]);
+
+      const edited = await qa.patch(`/api/tasks/${bugId}`, {
+        title: "Header overlaps the logo",
+        priority: "URGENT",
+        dueDate: "2026-11-03",
+        qaIssue: { kind: "BUG", actual: "Logo hidden" },
+      });
+      expect(edited.status).toBe(200);
+      expect(edited.body.data).toMatchObject({ title: "Header overlaps the logo", priority: "URGENT", dueDate: "2026-11-03" });
+      expect(edited.body.data.qaIssue).toMatchObject({ kind: "BUG", steps: "Open on mobile", actual: "Logo hidden" });
+      expect(edited.body.data.tags).toEqual(expect.arrayContaining(["bug"]));
+      expect(edited.body.data.tags).not.toContain("ui");
+
+      expect((await qa.patch(`/api/tasks/${bugId}`, { assigneeId: String(fx.emp2) })).status).toBe(403);
+      expect((await pm.patch(`/api/tasks/${task.id}`, { qaIssue: { kind: "BUG" } })).status).toBe(422);
+    });
+
+    it("the bug's QA verifies the developer's fix from review, or sends it back", async () => {
+      const task = await readyForReview();
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      const qa = await login(app, "outsider@t.test");
+      const logged = await qa.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Coupon ignored" }, { title: "Logo overlaps" }] });
+      const [fixed, notFixed] = logged.body.data.bugIds as string[];
+
+      // Nothing to verify until the developer sends the fix for review.
+      expect((await qa.post(`/api/tasks/${fixed}/approve`)).status).toBe(422);
+      await emp.post(`/api/tasks/${fixed}/submit`);
+      await emp.post(`/api/tasks/${notFixed}/submit`);
+
+      // Another employee who isn't the bug's QA can't.
+      const emp2 = await login(app, "emp2@t.test");
+      expect((await emp2.post(`/api/tasks/${fixed}/approve`)).status).toBe(403);
+
+      // The QA's approval closes the bug straight away (no second round of QA).
+      const verified = await qa.post(`/api/tasks/${fixed}/approve`, { feedback: "Works now." });
+      expect(verified.status).toBe(200);
+      expect(verified.body.data.status).toBe("APPROVED");
+      expect(await Notification.findOne({ recipient: fx.emp, type: "TASK_APPROVED", title: /verified your fix/ })).toBeTruthy();
+      const history = await qa.get(`/api/tasks/${fixed}/reviews`);
+      expect(history.body.data.map((r: { decision: string }) => r.decision)).toEqual(["SUBMITTED", "QA_PASSED"]);
+
+      // Or back to the developer with what's still wrong.
+      const reopened = await qa.post(`/api/tasks/${notFixed}/request-changes`, { feedback: "Still overlaps on iPhone." });
+      expect(reopened.body.data.status).toBe("CHANGES_REQUESTED");
+
+      // Through the status menu too.
+      await emp.post(`/api/tasks/${notFixed}/submit`);
+      expect((await qa.patch(`/api/tasks/${notFixed}/status`, { status: "APPROVED" })).body.data.status).toBe("APPROVED");
+    });
+
+    it("QA can report bugs after the task and the project are completed; they go to the developer straight away", async () => {
+      const task = await readyForReview();
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      const qa = await login(app, "outsider@t.test");
+      expect((await qa.post(`/api/tasks/${task.id}/qa/pass`)).body.data.status).toBe("APPROVED");
+      // Other tasks in the fixture project are done too, so it can be completed.
+      await Task.updateMany({ project: fx.project, _id: { $ne: task.id } }, { status: "APPROVED" });
+      expect((await pm.patch(`/api/projects/${fx.project}`, { status: "COMPLETED" })).status).toBe(200);
+
+      // The QA finds the project among the ones they test.
+      const mine = await qa.get("/api/projects?qaId=me");
+      expect(mine.body.data.map((p: { id: string }) => p.id)).toEqual([String(fx.project)]);
+
+      const reported = await qa.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Receipt email missing", dueDate: "2026-11-10" }] });
+      expect(reported.status).toBe(200);
+      // The finished task and project keep their status; the bug is with the developer.
+      expect(reported.body.data.status).toBe("APPROVED");
+      expect((await pm.get(`/api/projects/${fx.project}`)).body.data.status).toBe("COMPLETED");
+      const bug = await emp.get(`/api/tasks/${reported.body.data.bugIds[0]}`);
+      expect(bug.body.data).toMatchObject({ status: "TODO", type: "BUG", dueDate: "2026-11-10", assignee: { id: String(fx.emp) }, qa: { id: String(fx.outsider) } });
+      expect(await Notification.findOne({ recipient: fx.emp, type: "CHANGES_REQUESTED", title: /QA found 1 issue in/ })).toBeTruthy();
+      expect(await Notification.findOne({ recipient: fx.pm, type: "PROJECT_UPDATE", title: /after it was completed/ })).toBeTruthy();
+
+      // Only the project's QA, never the developer or another employee.
+      expect((await emp.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Own bug" }] })).status).toBe(403);
+      const emp2 = await login(app, "emp2@t.test");
+      expect((await emp2.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Not my project" }] })).status).toBe(403);
+      // Work that hasn't reached QA yet still can't take bug reports.
+      const fresh = await createTask();
+      expect((await qa.post(`/api/tasks/${fresh.id}/qa/issues`, { bugs: [{ title: "Too early" }] })).status).toBe(403);
+    });
+
     it("only the project's QA (or a manager) can pass or fail QA, never the developer", async () => {
       const task = await readyForReview();
       await pm.post(`/api/tasks/${task.id}/approve`);

@@ -9,6 +9,8 @@ export const listProjectsQuery = z
     clientId: objectId.optional(),
     managerId: objectId.optional(),
     memberId: objectId.optional(),
+    /** Projects the user tests as QA (the project's QA, or the tester of any of its tasks). */
+    qaId: z.union([z.literal("me"), objectId]).optional(),
     departmentId: objectId.optional(),
     sortBy: z.enum(["name", "deadline", "progress", "createdAt"]).default("createdAt"),
     sortOrder: sortOrder,

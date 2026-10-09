@@ -1,6 +1,6 @@
 import { Types, type QueryFilter } from "mongoose";
 import type { z } from "zod";
-import { Department, Project, User, type IUser } from "../models";
+import { Department, Project, Task, User, type IUser } from "../models";
 import type { AuthUser } from "../types/express";
 import { conflict, forbidden, notFound, unprocessable } from "../utils/errors";
 import { searchRegex } from "../validators/common";
@@ -143,4 +143,10 @@ export async function teamMemberIds(managerId: Types.ObjectId): Promise<Types.Ob
   const ids = new Map<string, Types.ObjectId>();
   for (const p of projects) for (const m of p.members) if (String(m) !== String(managerId)) ids.set(String(m), m);
   return [...ids.values()];
+}
+
+/** Whether the user tests anything as QA (a project's QA, a task's tester, or reported issues). Drives the "My bugs" page. */
+export async function isQaTester(userId: Types.ObjectId): Promise<boolean> {
+  const found = await Promise.all([Project.exists({ qa: userId }), Task.exists({ $or: [{ qa: userId }, { "qaIssue.reportedBy": userId }] })]);
+  return found.some(Boolean);
 }

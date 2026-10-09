@@ -126,6 +126,7 @@ export async function listTasks(user: AuthUser, q: z.output<typeof listTasksQuer
   } else if (q.assigneeId) f.assignee = q.assigneeId === "me" ? user._id : oid(q.assigneeId);
   if (q.reviewerId) f.reviewer = q.reviewerId === "me" ? user._id : oid(q.reviewerId);
   if (q.qaId) f.qa = q.qaId === "me" ? user._id : oid(q.qaId);
+  if (q.qaBugs) and.push({ qaIssue: { $ne: null }, $or: [{ qa: user._id }, { "qaIssue.reportedBy": user._id }] });
   if (q.departmentId) f.department = oid(q.departmentId);
   if (q.priority) f.priority = q.priority;
   const re = searchRegex(q.search);
@@ -147,7 +148,8 @@ export async function listTasks(user: AuthUser, q: z.output<typeof listTasksQuer
   const [items, total] = await Promise.all([
     Task.find(filter)
       .select(LIST_PROJECTION)
-      .populate(TASK_POPULATE)
+      // Bugs show which task they were found in.
+      .populate(q.qaBugs ? [...TASK_POPULATE, { path: "parent", select: "title" }] : TASK_POPULATE)
       .sort({ [sortField]: q.sortOrder === "desc" ? -1 : 1, _id: 1 })
       .skip(q.skip)
       .limit(q.pageSize)
@@ -164,7 +166,7 @@ export async function getTaskDetail(id: Types.ObjectId | string) {
     .lean();
   if (!task) throw notFound("Task");
   const [subtasks, attachments, commentCount] = await Promise.all([
-    Task.find({ parent: task._id }).select("title status assignee priority qaIssue.kind").populate("assignee", USER_SUMMARY).sort({ createdAt: 1, _id: 1 }).lean(),
+    Task.find({ parent: task._id }).select("title status assignee priority dueDate qaIssue.kind").populate("assignee", USER_SUMMARY).sort({ createdAt: 1, _id: 1 }).lean(),
     listFiles("TASK", task._id),
     Comment.countDocuments({ entityType: "TASK", entityId: task._id }),
   ]);
@@ -280,11 +282,19 @@ export async function createTask(actor: AuthUser, input: z.output<typeof createT
   return getTaskDetail(task._id);
 }
 
+/** What a bug's QA tester may edit (the PM edits everything). */
+const BUG_QA_FIELDS = new Set(["title", "description", "priority", "dueDate", "qaIssue"]);
+
 export async function updateTask(actor: AuthUser, id: string, input: z.output<typeof updateTaskSchema>) {
   const lean = await accessibleTask(actor, id);
   const manager = await canManageTask(actor, lean);
   const keys = Object.keys(input);
-  if (!manager) {
+  // QA manage the bugs they test: the report, its priority and when it must be fixed by.
+  const bugQa = !manager && Boolean(lean.qaIssue) && !isAssignee(actor, lean) && (await canQaTask(actor, lean));
+  if (input.qaIssue !== undefined && !lean.qaIssue) throw unprocessable("Only issues QA reported have a QA report.", [{ path: "qaIssue", message: "This task isn't a QA issue." }]);
+  if (bugQa) {
+    if (keys.some((k) => !BUG_QA_FIELDS.has(k))) throw forbidden("QA can change a bug's report, priority and due date only.");
+  } else if (!manager) {
     // Assignees may log their own time and nothing else.
     if (!isAssignee(actor, lean)) throw forbidden("You can't edit this task.");
     const other = keys.filter((k) => k !== "actualHours");
@@ -318,6 +328,7 @@ export async function updateTask(actor: AuthUser, id: string, input: z.output<ty
 
   const previousAssignee = task.assignee ? String(task.assignee) : null;
   const previousQaDue = task.qaDueDate?.getTime() ?? null;
+  const previousDue = task.dueDate?.getTime() ?? null;
   const previousQa = task.qa ? String(task.qa) : null;
   if (input.title !== undefined) task.title = input.title;
   if (input.description !== undefined) task.description = input.description;
@@ -332,6 +343,15 @@ export async function updateTask(actor: AuthUser, id: string, input: z.output<ty
   if (input.type !== undefined) task.type = input.type;
   if (input.startDate !== undefined) task.startDate = input.startDate;
   if (input.dueDate !== undefined) task.dueDate = input.dueDate;
+  if (input.qaIssue && task.qaIssue) {
+    const { kind, ...details } = input.qaIssue;
+    for (const [k, v] of Object.entries(details)) if (v !== undefined) task.set(`qaIssue.${k}`, v);
+    if (kind && kind !== task.qaIssue.kind) {
+      // Keep the kind tag in step with the report.
+      task.tags = [...new Set([...task.tags.filter((t) => t !== task.qaIssue!.kind.toLowerCase()), kind.toLowerCase()])];
+      task.set("qaIssue.kind", kind);
+    }
+  }
   const qaChanged = input.qaId !== undefined && (input.qaId ?? null) !== previousQa;
   if (qaChanged) {
     task.qa = input.qaId ? oid(input.qaId) : null;
@@ -365,6 +385,17 @@ export async function updateTask(actor: AuthUser, id: string, input: z.output<ty
       actor: actor._id,
       type: "DEADLINE_APPROACHING",
       title: task.qaDueDate ? `Finish QA on ${task.title} by ${isoDay(task.qaDueDate)}` : `The QA deadline on ${task.title} was removed`,
+      entityType: "TASK",
+      entityId: task._id,
+    });
+  }
+  const bugDueChanged = Boolean(task.qaIssue) && input.dueDate !== undefined && (task.dueDate?.getTime() ?? null) !== previousDue;
+  if (bugDueChanged && task.assignee && String(task.assignee) === previousAssignee) {
+    void notify({
+      recipients: [task.assignee],
+      actor: actor._id,
+      type: "DEADLINE_APPROACHING",
+      title: task.dueDate ? `Fix ${task.title} by ${isoDay(task.dueDate)}` : `The fix deadline on ${task.title} was removed`,
       entityType: "TASK",
       entityId: task._id,
     });
@@ -474,18 +505,37 @@ export async function submitForReview(actor: AuthUser, id: string, note?: string
   return getTaskDetail(updated._id);
 }
 
+/** A bug's QA tester checks the developer's fix themselves (no separate code review). */
+const isBugQa = (actor: AuthUser, task: Pick<ITask, "qaIssue" | "qa">) => Boolean(task.qaIssue && task.qa && String(task.qa) === String(actor._id));
+
 async function assertCanReview(actor: AuthUser, task: Awaited<ReturnType<typeof accessibleTask>>) {
-  if (!(await canReviewTask(actor, task))) throw forbidden("Only the reviewer can review this task.");
+  if (!isBugQa(actor, task) && !(await canReviewTask(actor, task))) throw forbidden("Only the reviewer can review this task.");
   // Nobody approves their own work.
   if (isAssignee(actor, task)) throw forbidden("You can't review a task assigned to you.");
   const testedStage = task.status === "TESTED" && Boolean(task.stage);
   if (task.status !== "IN_REVIEW" && !testedStage) throw unprocessable("Only tasks in review can be approved or sent back.");
 }
 
+/** The bug's QA approved the fix: it's done, without another round of QA. */
+async function verifyBugFix(actor: AuthUser, task: Awaited<ReturnType<typeof accessibleTask>>, feedback?: string) {
+  const updated = await applyStatus(actor, task._id, "APPROVED", { decision: "QA_PASSED", feedback: feedback || null }, { verb: "verified the fix for" });
+  void notify({
+    recipients: [updated.assignee],
+    actor: actor._id,
+    type: "TASK_APPROVED",
+    title: `${actor.name} verified your fix for ${updated.title}`,
+    body: feedback || null,
+    entityType: "TASK",
+    entityId: updated._id,
+  });
+  return getTaskDetail(updated._id);
+}
+
 /** `toQa`: the PM chose "In QA" on a reviewed stage subtask, so it goes to QA now instead of waiting to be completed. */
 export async function approve(actor: AuthUser, id: string, feedback?: string, options: { toQa?: boolean } = {}) {
   const task = await accessibleTask(actor, id);
   await assertCanReview(actor, task);
+  if (isBugQa(actor, task)) return verifyBugFix(actor, task, feedback);
   if (await isRollupSubtask(task)) return approveStageSubtask(actor, task, feedback, options.toQa);
   if (await hasRollupSubtasks(task)) {
     if (task.status !== "TESTED") {
@@ -609,6 +659,8 @@ export interface BugInput {
   actual?: string | null;
   environment?: string | null;
   priority: Priority;
+  /** When the developer should have it fixed. */
+  dueDate?: Date | null;
 }
 
 /** The structured QA report stored on each issue subtask. */
@@ -628,7 +680,7 @@ function issueFields(bug: BugInput, actor: AuthUser) {
   };
 }
 
-const issueLine = (b: BugInput) => `[${QA_ISSUE_LABELS[b.kind ?? "BUG"]}] ${b.title}`;
+const issueLine = (b: BugInput) => `[${QA_ISSUE_LABELS[b.kind ?? "BUG"]}] ${b.title}${b.dueDate ? ` (fix by ${isoDay(b.dueDate)})` : ""}`;
 
 /** Where QA's issues go: the Bug fixing stage for the workflow's QA stage, otherwise the task being tested. */
 async function issueStage(task: Awaited<ReturnType<typeof accessibleTask>>) {
@@ -654,6 +706,7 @@ async function insertIssues(actor: AuthUser, task: Awaited<ReturnType<typeof acc
       status: "TODO",
       priority: bug.priority,
       priorityRank: PRIORITY_RANK[bug.priority],
+      dueDate: bug.dueDate ?? null,
       ...issueFields(bug, actor),
     })),
   );
@@ -707,6 +760,7 @@ async function sendStageBackWithIssues(actor: AuthUser, qaStage: Awaited<ReturnT
  */
 export async function qaReport(actor: AuthUser, id: string, bugs: BugInput[]) {
   const task = await accessibleTask(actor, id);
+  if (isDone(task.status)) return reportAfterCompletion(actor, task, bugs);
   await assertCanQa(actor, task);
   const created = await insertIssues(actor, task, await issueStage(task), bugs);
   await recalcProjectStats(task.project);
@@ -723,6 +777,46 @@ export async function qaReport(actor: AuthUser, id: string, bugs: BugInput[]) {
   return { task: await getTaskDetail(task._id), bugIds: created.map((b) => String(b._id)) };
 }
 
+/**
+ * Bugs found after the work was finished (even after the project was completed).
+ * There's no testing round to finish, so they go to the developer straight away;
+ * the task and project keep their status and the project manager is told.
+ */
+async function reportAfterCompletion(actor: AuthUser, task: Awaited<ReturnType<typeof accessibleTask>>, bugs: BugInput[]) {
+  const project = await Project.findById(task.project).select("qa manager name").lean();
+  const projectQa = Boolean(project?.qa && String(project.qa) === String(actor._id));
+  if (!projectQa && !(await canQaTask(actor, task))) throw forbidden("Only this project's QA can report bugs on it.");
+  if (isAssignee(actor, task) && task.stage !== "QA") throw forbidden("You can't QA a task assigned to you.");
+
+  const bugStage = await issueStage(task);
+  const created = await insertIssues(actor, task, bugStage, bugs);
+  await recalcProjectStats(task.project);
+  const owner = bugStage ?? task;
+  const count = `${bugs.length} issue${bugs.length === 1 ? "" : "s"}`;
+  const list = bugs.map((b) => `• ${issueLine(b)}`).join("\n").slice(0, 900);
+  void logActivity({
+    actor: actor._id,
+    type: "TASK_QA_ISSUES_LOGGED",
+    verb: `reported ${count} after completion on`,
+    entityType: "TASK",
+    entityId: task._id,
+    entityName: task.title,
+    project: task.project,
+    department: task.department ?? null,
+  });
+  void notify({ recipients: [owner.assignee], actor: actor._id, type: "CHANGES_REQUESTED", title: `QA found ${count} in ${task.title}`, body: list, entityType: "TASK", entityId: owner._id });
+  void notify({
+    recipients: [project?.manager],
+    actor: actor._id,
+    type: "PROJECT_UPDATE",
+    title: `QA found ${count} in ${task.title} after it was completed`,
+    body: list,
+    entityType: "TASK",
+    entityId: task._id,
+  });
+  return { task: await getTaskDetail(task._id), bugIds: created.map((b) => String(b._id)) };
+}
+
 /** Issues logged in the current round of testing that are still open. */
 async function openRoundIssues(task: Awaited<ReturnType<typeof accessibleTask>>, bugStage: (ITask & { _id: Types.ObjectId }) | null) {
   return Task.find({
@@ -732,7 +826,7 @@ async function openRoundIssues(task: Awaited<ReturnType<typeof accessibleTask>>,
     // Only this round: earlier rounds' leftovers were already handled.
     ...(task.qaStartedAt ? { createdAt: { $gte: task.qaStartedAt } } : {}),
   })
-    .select("title priority qaIssue.kind")
+    .select("title priority dueDate qaIssue.kind")
     .sort({ createdAt: 1, _id: 1 })
     .lean();
 }
@@ -747,7 +841,7 @@ export async function qaComplete(actor: AuthUser, id: string, note?: string) {
   const bugStage = await issueStage(task);
   const open = await openRoundIssues(task, bugStage);
   if (!open.length) return { task: await qaPass(actor, id, note), issues: 0 };
-  const bugs: BugInput[] = open.map((o) => ({ title: o.title, kind: o.qaIssue?.kind, priority: o.priority }));
+  const bugs: BugInput[] = open.map((o) => ({ title: o.title, kind: o.qaIssue?.kind, priority: o.priority, dueDate: o.dueDate ?? null }));
   const detail = bugStage ? await sendStageBackWithIssues(actor, task, bugStage, bugs, note) : await sendBackWithIssues(actor, task, bugs, note);
   return { task: detail, issues: open.length };
 }

@@ -48,6 +48,11 @@ export async function listProjects(user: AuthUser, q: z.output<typeof listProjec
   if (q.managerId) filter.manager = oid(q.managerId);
   if (q.memberId) filter.$and = [{ $or: [{ members: oid(q.memberId) }, { manager: oid(q.memberId) }] }];
   if (q.departmentId) filter.department = oid(q.departmentId);
+  if (q.qaId) {
+    const qa = q.qaId === "me" ? user._id : oid(q.qaId);
+    const tested = await Task.distinct("project", { qa });
+    filter.$and = [...(filter.$and ?? []), { $or: [{ qa }, { _id: { $in: tested } }] }];
+  }
 
   const dir = q.sortOrder === "desc" ? -1 : 1;
   // Projects without a deadline sort last either way.

@@ -205,6 +205,9 @@ export function serializeTaskSummary(t: AnyObj, counts: TaskCounts = {}) {
     project: project ?? (idOf(t.project) ? { id: idOf(t.project)!, name: "" } : null),
     milestone: named(t.milestone),
     parentId: idOf(t.parent),
+    /** Populated only where a list needs it (e.g. My bugs). */
+    parent: t.parent instanceof Types.ObjectId ? null : named(t.parent),
+    issueKind: ((t.qaIssue as AnyObj | null | undefined)?.kind as string) ?? null,
     assignee: userSummary(t.assignee),
     reviewer: userSummary(t.reviewer),
     qa: userSummary(t.qa),
@@ -247,6 +250,7 @@ export function serializeTask(
       status: s.status as string,
       priority: (s.priority as string) ?? null,
       issueKind: ((s.qaIssue as AnyObj | null)?.kind as string) ?? null,
+      dueDate: isoDay(s.dueDate),
       assignee: userSummary(s.assignee),
     })),
     attachments: extra.attachments.map(serializeFile),

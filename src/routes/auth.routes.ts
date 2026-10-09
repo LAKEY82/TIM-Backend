@@ -7,6 +7,7 @@ import { parseBody } from "../middleware/validation.middleware";
 import { User } from "../models";
 import * as auth from "../services/auth.service";
 import { peekSessionId } from "../services/token.service";
+import { isQaTester } from "../services/user.service";
 import { forbidden, notFound } from "../utils/errors";
 import { noContent, ok } from "../utils/http";
 import { serializeUser } from "../utils/serialize";
@@ -85,7 +86,7 @@ authRouter.post("/login", loginLimiter, async (req, res) => {
   const { user, tokens } = await auth.login(email, password, clientInfo(req));
   setRefreshCookie(res, tokens.refreshToken, tokens.refreshExpiresAt);
   const full = await User.findById(user._id).populate("department", "name").lean();
-  ok(res, { user: serializeUser(full!, { withPermissions: true }), accessToken: tokens.accessToken }, "Signed in.");
+  ok(res, { user: { ...serializeUser(full!, { withPermissions: true }), isQaTester: await isQaTester(full!._id) }, accessToken: tokens.accessToken }, "Signed in.");
 });
 
 authRouter.post("/refresh", refreshLimiter, requireTrustedOrigin, async (req, res) => {
@@ -108,7 +109,7 @@ authRouter.post("/logout", requireTrustedOrigin, async (req, res) => {
 authRouter.get("/me", requireAuth, async (req, res) => {
   const user = await User.findById(currentUser(req).id).populate("department", "name").lean();
   if (!user) throw notFound("User");
-  ok(res, serializeUser(user, { withPermissions: true }));
+  ok(res, { ...serializeUser(user, { withPermissions: true }), isQaTester: await isQaTester(user._id) });
 });
 
 authRouter.post("/forgot-password", passwordLimiter, async (req, res) => {

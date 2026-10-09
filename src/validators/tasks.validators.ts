@@ -19,6 +19,8 @@ export const listTasksQuery = z
     includeReviews: queryBool,
     /** With assigneeId=me: also include tasks waiting for me to QA test them. */
     includeQa: queryBool,
+    /** "My bugs": issues I test or reported as QA. */
+    qaBugs: queryBool,
     departmentId: objectId.optional(),
     status: oneOrMany(z.enum(TASK_STATUSES)),
     priority: z.enum(PRIORITIES).optional(),
@@ -81,6 +83,16 @@ export const updateTaskSchema = z
     estimatedHours: z.number().min(0).max(1000).nullable(),
     actualHours: z.number().min(0).max(10000).nullable(),
     tags,
+    /** The QA report on a bug (only valid on issues QA reported). */
+    qaIssue: z
+      .object({
+        kind: z.enum(QA_ISSUE_KINDS),
+        steps: optionalText(5000),
+        expected: optionalText(2000),
+        actual: optionalText(2000),
+        environment: optionalText(300),
+      })
+      .partial(),
   })
   .partial()
   .superRefine(checkDates);
@@ -119,6 +131,8 @@ export const qaFailSchema = z.object({
           .nullish()
           .transform((v) => v || null),
         priority: z.enum(PRIORITIES).default("HIGH"),
+        /** When the developer should have it fixed. */
+        dueDate: dateInput,
       }),
     )
     .min(1, "Report at least one bug.")
