@@ -152,7 +152,9 @@ export async function setupWorkflow(actor: AuthUser, projectId: Types.ObjectId |
   if (input.designerId) stages.push({ stage: "DESIGN", assignee: oid(input.designerId) });
   if (input.frontendId) stages.push({ stage: "FRONTEND", assignee: oid(input.frontendId) });
   if (input.backendId) stages.push({ stage: "BACKEND", assignee: oid(input.backendId) });
-  stages.push({ stage: "QA", assignee: project.qa ?? null }, { stage: "BUG_FIXING", assignee: bugFixer ? oid(bugFixer) : null });
+  // Bug fixing isn't a stage yet: it's created when QA reports bugs, after development is finished.
+  stages.push({ stage: "QA", assignee: project.qa ?? null });
+  project.bugFixer = bugFixer ? oid(bugFixer) : null;
   const firstLevel = Math.min(...stages.map((s) => STAGE_META[s.stage].level));
 
   const tasks = await Task.insertMany(
@@ -179,7 +181,7 @@ export async function setupWorkflow(actor: AuthUser, projectId: Types.ObjectId |
 
   // Everyone on the workflow is on the project.
   const members = new Set(project.members.map(String));
-  for (const t of tasks) if (t.assignee && !idEquals(t.assignee, project.manager) && !members.has(String(t.assignee))) members.add(String(t.assignee));
+  for (const person of [...tasks.map((t) => t.assignee), project.bugFixer]) if (person && !idEquals(person, project.manager)) members.add(String(person));
   project.members = [...members].map(oid);
   project.workflow = true;
   await project.save();

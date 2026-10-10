@@ -16,6 +16,7 @@ import { clientsRouter } from "./routes/clients.routes";
 import { dailyTasksRouter } from "./routes/dailyTasks.routes";
 import { departmentsRouter } from "./routes/departments.routes";
 import { filesRouter } from "./routes/files.routes";
+import { meetingsRouter } from "./routes/meetings.routes";
 import { milestonesRouter } from "./routes/milestones.routes";
 import { notificationsRouter } from "./routes/notifications.routes";
 import { projectsRouter } from "./routes/projects.routes";
@@ -59,6 +60,7 @@ export function createApp() {
   api.use("/projects", projectsRouter);
   api.use("/tasks", tasksRouter);
   api.use("/milestones", milestonesRouter);
+  api.use("/meetings", meetingsRouter);
   api.use("/clients", clientsRouter);
   api.use("/notifications", notificationsRouter);
   api.use("/activity", activitiesRouter);

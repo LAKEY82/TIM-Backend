@@ -440,6 +440,81 @@ describe("tasks", () => {
       expect((await qa.post(`/api/tasks/${fresh.id}/qa/issues`, { bugs: [{ title: "Too early" }] })).status).toBe(403);
     });
 
+    it("a tested task stays in its QA's list with its bugs until it passes the retest", async () => {
+      const task = await readyForReview();
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      const qa = await login(app, "outsider@t.test");
+      const mine = async () => (await qa.get("/api/tasks?assigneeId=me&includeQa=true")).body.data as { id: string; status: string; issueCount: number; openIssueCount: number }[];
+
+      const logged = await qa.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Coupon ignored" }, { title: "Logo overlaps" }] });
+      expect(await mine()).toEqual([expect.objectContaining({ id: task.id, status: "IN_QA", issueCount: 2, openIssueCount: 2 })]);
+
+      // Back with the developer: still the QA's to retest (and the bugs themselves aren't separate rows).
+      await qa.post(`/api/tasks/${task.id}/qa/complete`);
+      expect(await mine()).toEqual([expect.objectContaining({ id: task.id, status: "CHANGES_REQUESTED", issueCount: 2 })]);
+      const bugs = await qa.get(`/api/tasks?issuesOf=${task.id}`);
+      expect(bugs.body.data.map((b: { id: string }) => b.id).sort()).toEqual([...logged.body.data.bugIds].sort());
+
+      for (const id of logged.body.data.bugIds as string[]) await emp.patch(`/api/tasks/${id}/status`, { status: "COMPLETED" });
+      expect((await mine())[0]).toMatchObject({ openIssueCount: 0 });
+      await emp.post(`/api/tasks/${task.id}/submit`);
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      expect((await mine())[0]).toMatchObject({ status: "IN_QA" });
+
+      // Passing the retest takes it off the list.
+      await qa.post(`/api/tasks/${task.id}/qa/complete`);
+      expect(await mine()).toEqual([]);
+    });
+
+    it("the developer's list nests bugs under their own task instead of listing them separately", async () => {
+      const task = await readyForReview();
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      const qa = await login(app, "outsider@t.test");
+      const logged = await qa.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Coupon ignored" }, { title: "Logo overlaps" }] });
+      const rows = async (query: string) => (await emp.get(`/api/tasks?assigneeId=me&includeQa=true${query}`)).body.data as { id: string; issueCount: number }[];
+
+      const nested = await rows("&nestIssues=true");
+      expect(nested.map((t) => t.id)).toEqual([task.id]);
+      expect(nested[0]!.issueCount).toBe(2);
+      // Without nesting (e.g. while filtering) the bugs are their own rows.
+      expect((await rows("")).map((t) => t.id).sort()).toEqual([task.id, ...logged.body.data.bugIds].sort());
+    });
+
+    it("lists the QA stage's bugs from Bug fixing", async () => {
+      await pm.post(`/api/projects/${fx.project}/workflow`, { frontendId: String(fx.emp), qaId: String(fx.head) });
+      const flow = async () => (await pm.get(`/api/projects/${fx.project}/workflow`)).body.data as { id: string; stage: string; issueCount: number }[];
+      const frontend = (await flow()).find((s) => s.stage === "FRONTEND")!;
+      await emp.post(`/api/tasks/${frontend.id}/submit`);
+      await pm.post(`/api/tasks/${frontend.id}/approve`);
+      const qaStage = (await flow()).find((s) => s.stage === "QA")!;
+      const qa = await login(app, "head@t.test");
+      expect((await qa.get(`/api/tasks?issuesOf=${qaStage.id}`)).body.data).toEqual([]);
+
+      await qa.post(`/api/tasks/${qaStage.id}/qa/issues`, { bugs: [{ title: "Checkout broken" }] });
+      expect((await flow()).find((s) => s.stage === "QA")).toMatchObject({ issueCount: 1 });
+      expect((await qa.get(`/api/tasks?issuesOf=${qaStage.id}`)).body.data.map((b: { title: string }) => b.title)).toEqual(["Checkout broken"]);
+    });
+
+    it("project analytics count real work: developers on tasks and bugs, QA on the subtasks they test", async () => {
+      const task = await readyForReview();
+      await pm.post(`/api/tasks/${task.id}/approve`);
+      const qa = await login(app, "outsider@t.test");
+      await qa.post(`/api/tasks/${task.id}/qa/issues`, { bugs: [{ title: "Coupon ignored" }] });
+      // A workflow phase only contains work, so it isn't counted.
+      await Task.create({ title: "Frontend development", project: fx.project, stage: "FRONTEND", status: "IN_PROGRESS", assignee: fx.emp });
+
+      const a = (await pm.get(`/api/analytics/projects/${fx.project}`)).body.data;
+      expect(a.totalTasks).toBe(2); // the task and its bug
+      const dev = a.workload.find((w: { userId: string; role: string }) => w.userId === String(fx.emp) && w.role === "DEVELOPER");
+      expect(dev).toMatchObject({ assigned: 2, completed: 0 });
+      const tester = a.workload.find((w: { userId: string; role: string }) => w.userId === String(fx.outsider) && w.role === "QA");
+      expect(tester).toMatchObject({ assigned: 1, completed: 0 }); // the task they test, not the bug
+
+      await qa.post(`/api/tasks/${task.id}/qa/pass`);
+      const after = (await pm.get(`/api/analytics/projects/${fx.project}`)).body.data;
+      expect(after.workload.find((w: { userId: string; role: string }) => w.role === "QA")).toMatchObject({ assigned: 0, completed: 1 });
+    });
+
     it("only the project's QA (or a manager) can pass or fail QA, never the developer", async () => {
       const task = await readyForReview();
       await pm.post(`/api/tasks/${task.id}/approve`);
@@ -663,6 +738,8 @@ describe("tasks", () => {
       const qaStage = (await flow()).find((s) => s.stage === "QA")!;
       expect(qaStage.status).toBe("IN_QA");
       const qa = await login(app, "head@t.test");
+      // Bug fixing only appears once QA reports bugs.
+      expect((await flow()).map((s) => s.stage)).not.toContain("BUG_FIXING");
 
       await qa.post(`/api/tasks/${qaStage.id}/qa/issues`, { bugs: [{ title: "Checkout broken" }] });
       await qa.post(`/api/tasks/${qaStage.id}/qa/issues`, { bugs: [{ title: "Search slow", kind: "PERFORMANCE" }] });
@@ -702,9 +779,7 @@ describe("tasks", () => {
         ["FRONTEND", "WAITING"],
         ["BACKEND", "WAITING"],
         ["QA", "WAITING"],
-        ["BUG_FIXING", "WAITING"],
-      ]);
-      expect(setup.body.data.find((s: Stage) => s.stage === "BUG_FIXING").assignee.id).toBe(String(fx.emp)); // defaults to the frontend dev
+      ]); // no Bug fixing stage until QA reports bugs
       expect((await pm.get(`/api/projects/${fx.project}`)).body.data).toMatchObject({ workflow: true, qa: { id: String(fx.head) } });
       expect((await pm.post(`/api/projects/${fx.project}/workflow`, { frontendId: String(fx.emp) })).status).toBe(409);
 
@@ -738,7 +813,7 @@ describe("tasks", () => {
       expect(failed.status).toBe(200);
       expect(failed.body.data.status).toBe("WAITING");
       const bugFixing = await byStage("BUG_FIXING");
-      expect(bugFixing).toMatchObject({ status: "TODO", subtaskCount: 2 });
+      expect(bugFixing).toMatchObject({ status: "TODO", subtaskCount: 2, assignee: { id: String(fx.emp) } }); // defaults to the frontend dev
       const bugs = await Task.find({ parent: bugFixing.id }).lean();
       expect(bugs.every((b) => String(b.assignee) === String(fx.emp))).toBe(true);
       expect(await Notification.findOne({ recipient: fx.pm, title: /QA found 2 issues/ })).toBeTruthy();
@@ -770,11 +845,37 @@ describe("tasks", () => {
       expect(flow.map((s) => [s.stage, s.status, s.assignee?.id])).toEqual([
         ["FRONTEND", "TODO", String(fx.emp)],
         ["QA", "WAITING", String(fx.head)],
-        ["BUG_FIXING", "WAITING", String(fx.emp2)],
       ]);
+      // The bug fixer is remembered for when QA reports bugs.
+      expect(String((await Project.findById(res.body.data.id).lean())!.bugFixer)).toBe(String(fx.emp2));
       const bad = await pm.post("/api/projects", { name: "Delta", type: "INTERNAL", qaId: String(fx.head), workflow: {} });
       expect(bad.status).toBe(422);
       expect(bad.body.errors.map((e: { path: string }) => e.path)).toContain("workflow");
+    });
+
+    it("phases that haven't opened stay out of the project's task list", async () => {
+      await pm.post(`/api/projects/${fx.project}/workflow`, { frontendId: String(fx.emp), qaId: String(fx.head) });
+      const list = async (query = "") => ((await pm.get(`/api/tasks?projectId=${fx.project}${query}`)).body.data as { stage: string | null }[]).map((t) => t.stage);
+      expect(await list()).not.toContain("QA");
+      expect(await list()).toContain("FRONTEND");
+      // Still there in the Workflow card, and when filtering for Waiting.
+      expect((await stages()).map((s) => s.stage)).toContain("QA");
+      expect(await list("&status=WAITING")).toEqual(["QA"]);
+    });
+
+    it("the developer's working list shows a split stage's subtasks, not the stage or stages still waiting", async () => {
+      await pm.post(`/api/projects/${fx.project}/workflow`, { designerId: String(fx.emp2), frontendId: String(fx.emp), qaId: String(fx.head) });
+      const design = await byStage("DESIGN");
+      await (await login(app, "emp2@t.test")).post(`/api/tasks/${design.id}/submit`);
+      await pm.post(`/api/tasks/${design.id}/approve`);
+      const frontend = await byStage("FRONTEND");
+      for (const title of ["Login", "Signup"]) await pm.post("/api/tasks", { title, projectId: String(fx.project), parentId: frontend.id });
+      await Task.create({ title: "Old waiting stage", project: fx.project, stage: "BUG_FIXING", status: "WAITING", assignee: fx.emp });
+
+      const titles = async (query: string) => ((await emp.get(`/api/tasks?assigneeId=me&includeQa=true${query}`)).body.data as { title: string }[]).map((t) => t.title).sort();
+      expect(await titles("&nestIssues=true")).toEqual(["Login", "Signup"]);
+      // Filtering still finds everything.
+      expect(await titles("")).toEqual(expect.arrayContaining(["Login", "Signup", expect.stringMatching(/^Frontend development/)]));
     });
 
     it("stage subtasks: the developer's list, roll-up, PM-only completion, per-subtask QA, retest, approval and shipping", async () => {

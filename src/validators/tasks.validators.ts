@@ -21,6 +21,10 @@ export const listTasksQuery = z
     includeQa: queryBool,
     /** "My bugs": issues I test or reported as QA. */
     qaBugs: queryBool,
+    /** The bugs QA reported on a task (for the workflow's QA stage: the ones under Bug fixing). */
+    issuesOf: objectId.optional(),
+    /** With assigneeId=me: leave out bugs on my own tasks (they're listed under those tasks instead). */
+    nestIssues: queryBool,
     departmentId: objectId.optional(),
     status: oneOrMany(z.enum(TASK_STATUSES)),
     priority: z.enum(PRIORITIES).optional(),

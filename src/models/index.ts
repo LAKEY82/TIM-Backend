@@ -13,3 +13,4 @@ export * from "./Notification";
 export * from "./Activity";
 export * from "./DailyTask";
 export * from "./Setting";
+export * from "./Meeting";

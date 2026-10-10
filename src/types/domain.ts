@@ -61,7 +61,7 @@ export type MilestoneStatus = (typeof MILESTONE_STATUSES)[number];
 export const CLIENT_STATUSES = ["ACTIVE", "INACTIVE"] as const;
 export type ClientStatus = (typeof CLIENT_STATUSES)[number];
 
-export const ENTITY_TYPES = ["PROJECT", "TASK", "MILESTONE", "USER", "CLIENT", "DEPARTMENT", "COMMENT"] as const;
+export const ENTITY_TYPES = ["PROJECT", "TASK", "MILESTONE", "USER", "CLIENT", "DEPARTMENT", "COMMENT", "MEETING"] as const;
 export type EntityType = (typeof ENTITY_TYPES)[number];
 
 export const NOTIFICATION_TYPES = [
@@ -72,5 +72,9 @@ export const NOTIFICATION_TYPES = [
   "DEADLINE_APPROACHING",
   "MENTION",
   "PROJECT_UPDATE",
+  "MEETING_INVITE",
 ] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
+
+export const MEETING_PLATFORMS = ["ZOOM", "GOOGLE_MEET", "TEAMS", "OTHER"] as const;
+export type MeetingPlatform = (typeof MEETING_PLATFORMS)[number];

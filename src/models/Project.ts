@@ -13,6 +13,8 @@ export interface IProject {
   qa?: Types.ObjectId | null;
   /** True once the staged workflow (Design → Development → QA → Bug fixing) is set up. */
   workflow: boolean;
+  /** Who gets the Bug fixing stage; it's only created once QA reports bugs on the QA stage. */
+  bugFixer?: Types.ObjectId | null;
   /** Bounded (a project team), queried through a multikey index. */
   members: Types.ObjectId[];
   department?: Types.ObjectId | null;
@@ -39,6 +41,7 @@ const projectSchema = new Schema<IProject>(
     manager: { type: Schema.Types.ObjectId, ref: "User", default: null },
     qa: { type: Schema.Types.ObjectId, ref: "User", default: null },
     workflow: { type: Boolean, default: false },
+    bugFixer: { type: Schema.Types.ObjectId, ref: "User", default: null },
     members: [{ type: Schema.Types.ObjectId, ref: "User" }],
     department: { type: Schema.Types.ObjectId, ref: "Department", default: null },
     startDate: { type: Date, default: null },

@@ -192,6 +192,9 @@ export interface TaskCounts {
   subtaskCount?: number;
   completedSubtaskCount?: number;
   commentCount?: number;
+  /** Bugs QA reported on the task, and how many are still open. */
+  issueCount?: number;
+  openIssueCount?: number;
 }
 
 export function serializeTaskSummary(t: AnyObj, counts: TaskCounts = {}) {
@@ -221,6 +224,8 @@ export function serializeTaskSummary(t: AnyObj, counts: TaskCounts = {}) {
     subtaskCount: counts.subtaskCount ?? 0,
     completedSubtaskCount: counts.completedSubtaskCount ?? 0,
     commentCount: counts.commentCount ?? 0,
+    issueCount: counts.issueCount ?? 0,
+    openIssueCount: counts.openIssueCount ?? 0,
     tags: (t.tags as string[]) ?? [],
   };
 }
@@ -343,5 +348,23 @@ export function serializeDailyTask(d: AnyObj) {
     estimatedHours: (d.estimatedHours as number | null) ?? null,
     dueTime: (d.dueTime as string | null) ?? null,
     note: (d.note as string | null) ?? null,
+  };
+}
+
+export function serializeMeeting(m: AnyObj) {
+  const organizer = userSummary(m.organizer);
+  return {
+    id: idOf(m._id)!,
+    title: m.title as string,
+    description: (m.description as string | null) ?? null,
+    platform: m.platform as string,
+    link: (m.link as string | null) ?? null,
+    startAt: iso(m.startAt),
+    endAt: iso(m.endAt),
+    project: named(m.project),
+    organizer,
+    participants: ((m.participants as unknown[]) ?? []).map(userSummary).filter(Boolean),
+    createdAt: iso(m.createdAt),
+    updatedAt: iso(m.updatedAt),
   };
 }

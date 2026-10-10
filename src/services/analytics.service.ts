@@ -258,7 +258,10 @@ export async function companyAnalytics(range: Range) {
 
 export async function projectAnalytics(user: AuthUser, projectId: string) {
   const project = await accessibleProject(user, projectId);
-  const match = { project: project._id };
+  // Real work only: tasks, subtasks and bugs. Workflow phases (Frontend development, QA testing…) just contain them.
+  const match = { project: project._id, stage: null };
+  // QA are counted on the subtasks they test (not on bugs, which are the developers' work).
+  const tested = { ...match, qaIssue: null };
   const now = new Date();
   const range = resolveRange(undefined, undefined, 8);
 
@@ -281,6 +284,9 @@ export async function projectAnalytics(user: AuthUser, projectId: string) {
   const total = statusRows.reduce((sum, r) => sum + r.n, 0);
   const done = (s.get("COMPLETED") ?? 0) + (s.get("APPROVED") ?? 0);
   const assigneeIds = (members as (Types.ObjectId | null)[]).filter((m): m is Types.ObjectId => Boolean(m));
+  const testers = (await Task.find({ ...tested, qa: { $ne: null } }).distinct("qa")) as Types.ObjectId[];
+  const qaIds = [...new Map([...testers, ...(project.qa ? [project.qa] : [])].map((id) => [String(id), id])).values()];
+  const [developers, qa] = await Promise.all([workloadFor(assigneeIds, match), workloadFor(qaIds, tested, { by: "qa" })]);
   const users = await User.find({ _id: { $in: assigneeIds } }).select("firstName lastName").lean();
   const nameOf = new Map(users.map((u) => [String(u._id), `${u.firstName} ${u.lastName ?? ""}`.trim()]));
 
@@ -299,7 +305,7 @@ export async function projectAnalytics(user: AuthUser, projectId: string) {
       .map((h) => ({ userId: String(h._id), name: nameOf.get(String(h._id)) ?? "Unknown", estimatedHours: h.est, actualHours: h.act })),
     estimatedHours: hours.reduce((sum, h) => sum + h.est, 0),
     actualHours: hours.reduce((sum, h) => sum + h.act, 0),
-    workload: await workloadFor(assigneeIds, match),
+    workload: [...developers.map((w) => ({ ...w, role: "DEVELOPER" as const })), ...qa.map((w) => ({ ...w, role: "QA" as const }))],
     activity,
   };
 }

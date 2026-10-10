@@ -13,16 +13,26 @@ export interface WorkloadEntry {
   inReview: number;
   blocked: number;
   overdue: number;
+  /** In a project: whether the counts are the work they do (developer) or the work they test (QA). */
+  role?: "DEVELOPER" | "QA";
 }
 
 /**
  * Factual workload per person from a single aggregation over their tasks.
  * "assigned" and "estimatedHours" count open work only. Deliberately no score.
+ * By default people are counted on the tasks assigned to them; `by: "qa"` counts
+ * QA testers on the tasks they test, overdue against the QA due date.
  */
-export async function workloadFor(userIds: Types.ObjectId[], taskFilter: Record<string, unknown> = {}): Promise<WorkloadEntry[]> {
+export async function workloadFor(
+  userIds: Types.ObjectId[],
+  taskFilter: Record<string, unknown> = {},
+  options: { by?: "assignee" | "qa" } = {},
+): Promise<WorkloadEntry[]> {
   if (userIds.length === 0) return [];
   const now = new Date();
   const done = [...DONE_STATUSES];
+  const by = options.by ?? "assignee";
+  const due = by === "qa" ? "$qaDueDate" : "$dueDate";
 
   const [rows, users] = await Promise.all([
     Task.aggregate<{
@@ -34,10 +44,10 @@ export async function workloadFor(userIds: Types.ObjectId[], taskFilter: Record<
       blocked: number;
       overdue: number;
     }>([
-      { $match: { ...taskFilter, assignee: { $in: userIds } } },
+      { $match: { ...taskFilter, [by]: { $in: userIds } } },
       {
         $group: {
-          _id: "$assignee",
+          _id: `$${by}`,
           assigned: { $sum: { $cond: [{ $in: ["$status", done] }, 0, 1] } },
           estimatedHours: { $sum: { $cond: [{ $in: ["$status", done] }, 0, { $ifNull: ["$estimatedHours", 0] }] } },
           completed: { $sum: { $cond: [{ $in: ["$status", done] }, 1, 0] } },
@@ -45,7 +55,7 @@ export async function workloadFor(userIds: Types.ObjectId[], taskFilter: Record<
           blocked: { $sum: { $cond: [{ $eq: ["$status", "BLOCKED"] }, 1, 0] } },
           overdue: {
             $sum: {
-              $cond: [{ $and: [{ $not: [{ $in: ["$status", done] }] }, { $ne: ["$dueDate", null] }, { $lt: ["$dueDate", now] }] }, 1, 0],
+              $cond: [{ $and: [{ $not: [{ $in: ["$status", done] }] }, { $ne: [due, null] }, { $lt: [due, now] }] }, 1, 0],
             },
           },
         },

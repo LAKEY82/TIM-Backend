@@ -4,8 +4,8 @@ import { Comment, DailyTask, Department, FileModel, Milestone, Project, Task, Us
 import { DONE_STATUSES, PRIORITY_RANK, QA_ISSUE_LABELS, ROLLUP_STAGES, WORKFLOW_STAGES, type Priority, type QaIssueKind, type QaResult, type ReviewDecision, type TaskStatus, type WorkflowStage } from "../types/domain";
 import type { AuthUser } from "../types/express";
 import { forbidden, notFound, unprocessable } from "../utils/errors";
-import { isoDay, serializeTask, serializeTaskSummary } from "../utils/serialize";
-import { STAGE_META } from "../utils/workflow";
+import { idOf, isoDay, serializeTask, serializeTaskSummary } from "../utils/serialize";
+import { STAGE_META, stageTitle } from "../utils/workflow";
 import { searchRegex } from "../validators/common";
 import type { createTaskSchema, listTasksQuery, updateTaskSchema } from "../validators/tasks.validators";
 import { accessibleProject, accessibleTask, canManageTask, canQaTask, canReviewTask, isAssignee, taskScopeFilter } from "./access.service";
@@ -83,10 +83,41 @@ export async function summaryCounts(taskIds: Types.ObjectId[]) {
   });
 }
 
+/**
+ * Where a task's QA issues live: under the task itself, or for the workflow's
+ * QA stage under the project's Bug fixing stage. Keyed by task id.
+ */
+async function issueParents(tasks: Pick<ITask & { _id: Types.ObjectId }, "_id" | "stage" | "project">[]) {
+  // Lists populate the project, so read its id either way.
+  const projectId = (p: unknown) => idOf(p)!;
+  const qaProjects = tasks.filter((t) => t.stage === "QA").map((t) => projectId(t.project));
+  const bugStages = qaProjects.length ? await Task.find({ project: { $in: qaProjects }, stage: "BUG_FIXING" }).select("project").lean() : [];
+  const byProject = new Map(bugStages.map((s) => [String(s.project), s._id]));
+  return new Map(tasks.map((t) => [String(t._id), t.stage === "QA" ? (byProject.get(projectId(t.project)) ?? null) : t._id]));
+}
+
+/** Total and open QA issues under each parent. */
+async function issueCounts(parentIds: Types.ObjectId[]) {
+  if (!parentIds.length) return new Map<string, { total: number; open: number }>();
+  const rows = await Task.aggregate<{ _id: Types.ObjectId; total: number; open: number }>([
+    { $match: { parent: { $in: parentIds }, qaIssue: { $ne: null } } },
+    { $group: { _id: "$parent", total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", [...DONE_STATUSES]] }, 0, 1] } } } },
+  ]);
+  return new Map(rows.map((r) => [String(r._id), { total: r.total, open: r.open }]));
+}
+
 /** Serializes lean tasks (already populated) as TaskSummary DTOs with counts. */
 export async function toSummaries(tasks: (ITask & { _id: Types.ObjectId })[]) {
-  const counts = await summaryCounts(tasks.map((t) => t._id));
-  return tasks.map((t) => serializeTaskSummary(t, counts(t._id)));
+  const parents = await issueParents(tasks);
+  const [counts, issues] = await Promise.all([
+    summaryCounts(tasks.map((t) => t._id)),
+    issueCounts([...parents.values()].filter((v): v is Types.ObjectId => Boolean(v))),
+  ]);
+  return tasks.map((t) => {
+    const parent = parents.get(String(t._id));
+    const n = parent ? issues.get(String(parent)) : undefined;
+    return serializeTaskSummary(t, { ...counts(t._id), issueCount: n?.total ?? 0, openIssueCount: n?.open ?? 0 });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -121,17 +152,40 @@ export async function listTasks(user: AuthUser, q: z.output<typeof listTasksQuer
     // "My tasks": what's assigned to me, plus what's waiting on me as reviewer or QA tester.
     const mine: QueryFilter<ITask>[] = [{ assignee: user._id }];
     if (q.includeReviews) mine.push(await awaitingReviewFilter(user));
-    if (q.includeQa) mine.push({ qa: user._id, status: "IN_QA" });
+    // Work I test stays with me from the first test until it passes QA (bugs, fixes and the retest included).
+    if (q.includeQa) mine.push({ qa: user._id, qaIssue: null, $or: [{ status: "IN_QA" }, { qaStartedAt: { $ne: null }, status: { $nin: [...DONE_STATUSES] } }] });
     and.push({ $or: mine });
   } else if (q.assigneeId) f.assignee = q.assigneeId === "me" ? user._id : oid(q.assigneeId);
+  if (q.assigneeId === "me" && q.nestIssues) {
+    // The working list shows only the tasks to act on:
+    // - bugs on a task that's mine show under that task, not as rows of their own;
+    const bugParents = (await Task.distinct("parent", { assignee: user._id, qaIssue: { $ne: null } })) as Types.ObjectId[];
+    const mineParents = bugParents.length ? ((await Task.distinct("_id", { _id: { $in: bugParents }, assignee: user._id })) as Types.ObjectId[]) : [];
+    if (mineParents.length) and.push({ $nor: [{ qaIssue: { $ne: null }, parent: { $in: mineParents } }] });
+    // - a Design / Frontend / Backend stage broken into subtasks follows them, so the subtasks are listed instead;
+    const myStages = (await Task.distinct("_id", { assignee: user._id, stage: { $in: [...ROLLUP_STAGES] } })) as Types.ObjectId[];
+    const containers = myStages.length ? ((await Task.distinct("parent", { parent: { $in: myStages } })) as Types.ObjectId[]) : [];
+    if (containers.length) and.push({ _id: { $nin: containers } });
+    // - stages that haven't opened yet wait off the list.
+    and.push({ status: { $ne: "WAITING" } });
+  }
   if (q.reviewerId) f.reviewer = q.reviewerId === "me" ? user._id : oid(q.reviewerId);
   if (q.qaId) f.qa = q.qaId === "me" ? user._id : oid(q.qaId);
+  if (q.issuesOf) {
+    const of = await Task.findById(q.issuesOf).select("stage project").lean();
+    const parent = of ? (await issueParents([of])).get(String(of._id)) : null;
+    // Unknown task, or a QA stage with no bugs yet: nothing to list.
+    and.push({ qaIssue: { $ne: null }, parent: parent ?? null, _id: { $exists: Boolean(parent) } });
+  }
   if (q.qaBugs) and.push({ qaIssue: { $ne: null }, $or: [{ qa: user._id }, { "qaIssue.reportedBy": user._id }] });
   if (q.departmentId) f.department = oid(q.departmentId);
   if (q.priority) f.priority = q.priority;
   const re = searchRegex(q.search);
   if (re) f.title = re;
   if (q.status?.length) f.status = { $in: q.status };
+  // Workflow phases that haven't opened (QA testing, Bug fixing) aren't work yet: they stay in the
+  // project's Workflow card, not in task lists, unless someone filters for Waiting.
+  if (!q.status?.includes("WAITING")) and.push({ $nor: [{ stage: { $ne: null }, status: "WAITING" }] });
 
   const due: Record<string, Date> = {};
   if (q.dueFrom) due.$gte = startOfDay(q.dueFrom);
@@ -682,10 +736,37 @@ function issueFields(bug: BugInput, actor: AuthUser) {
 
 const issueLine = (b: BugInput) => `[${QA_ISSUE_LABELS[b.kind ?? "BUG"]}] ${b.title}${b.dueDate ? ` (fix by ${isoDay(b.dueDate)})` : ""}`;
 
-/** Where QA's issues go: the Bug fixing stage for the workflow's QA stage, otherwise the task being tested. */
-async function issueStage(task: Awaited<ReturnType<typeof accessibleTask>>) {
+/**
+ * Where QA's issues go: the Bug fixing stage for the workflow's QA stage, otherwise the task being tested.
+ * With `create`, the Bug fixing stage is created the first time QA reports bugs, so it never shows up
+ * before development is finished. It waits until QA completes testing.
+ */
+async function issueStage(task: Awaited<ReturnType<typeof accessibleTask>>, create?: AuthUser) {
   if (task.stage !== "QA") return null;
-  return Task.findOne({ project: task.project, stage: "BUG_FIXING" }).lean();
+  const existing = await Task.findOne({ project: task.project, stage: "BUG_FIXING" }).lean();
+  if (existing || !create) return existing;
+  const [project, frontend] = await Promise.all([
+    Project.findById(task.project).select("name manager bugFixer priority department").lean(),
+    Task.findOne({ project: task.project, stage: { $in: ["FRONTEND", "BACKEND"] } }).sort({ stage: -1 }).select("assignee").lean(),
+  ]);
+  if (!project) throw notFound("Project");
+  const priority = project.priority;
+  const stage = await Task.create({
+    title: stageTitle("BUG_FIXING", project.name),
+    description: STAGE_META.BUG_FIXING.description,
+    project: project._id,
+    stage: "BUG_FIXING",
+    assignee: project.bugFixer ?? frontend?.assignee ?? null,
+    reviewer: project.manager ?? null,
+    createdBy: create._id,
+    department: project.department ?? null,
+    status: "WAITING",
+    priority,
+    priorityRank: PRIORITY_RANK[priority],
+    type: STAGE_META.BUG_FIXING.type,
+    tags: ["workflow"],
+  });
+  return stage.toObject();
 }
 
 /** Each reported issue becomes a BUG subtask for the developer (of the task, or of Bug fixing). */
@@ -762,7 +843,7 @@ export async function qaReport(actor: AuthUser, id: string, bugs: BugInput[]) {
   const task = await accessibleTask(actor, id);
   if (isDone(task.status)) return reportAfterCompletion(actor, task, bugs);
   await assertCanQa(actor, task);
-  const created = await insertIssues(actor, task, await issueStage(task), bugs);
+  const created = await insertIssues(actor, task, await issueStage(task, actor), bugs);
   await recalcProjectStats(task.project);
   void logActivity({
     actor: actor._id,
@@ -788,7 +869,7 @@ async function reportAfterCompletion(actor: AuthUser, task: Awaited<ReturnType<t
   if (!projectQa && !(await canQaTask(actor, task))) throw forbidden("Only this project's QA can report bugs on it.");
   if (isAssignee(actor, task) && task.stage !== "QA") throw forbidden("You can't QA a task assigned to you.");
 
-  const bugStage = await issueStage(task);
+  const bugStage = await issueStage(task, actor);
   const created = await insertIssues(actor, task, bugStage, bugs);
   await recalcProjectStats(task.project);
   const owner = bugStage ?? task;
@@ -850,7 +931,7 @@ export async function qaComplete(actor: AuthUser, id: string, note?: string) {
 export async function qaFail(actor: AuthUser, id: string, bugs: BugInput[], note?: string) {
   const task = await accessibleTask(actor, id);
   await assertCanQa(actor, task);
-  const bugStage = await issueStage(task);
+  const bugStage = await issueStage(task, actor);
   const created = await insertIssues(actor, task, bugStage, bugs);
   const detail = bugStage ? await sendStageBackWithIssues(actor, task, bugStage, bugs, note) : await sendBackWithIssues(actor, task, bugs, note);
   return { task: detail, bugIds: created.map((b) => String(b._id)) };

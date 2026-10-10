@@ -15,7 +15,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "seed": "tsx scripts/seed.ts"
+    "seed": "tsx scripts/seed.ts",
+    "cleanup:bug-stages": "tsx scripts/remove-early-bug-stages.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1146.0",
