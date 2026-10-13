@@ -368,3 +368,15 @@ export function serializeMeeting(m: AnyObj) {
     updatedAt: iso(m.updatedAt),
   };
 }
+
+export function serializeProjectLink(l: AnyObj) {
+  return {
+    id: idOf(l._id)!,
+    projectId: idOf(l.project),
+    title: l.title as string,
+    url: l.url as string,
+    kind: l.kind as string,
+    addedBy: userSummary(l.addedBy),
+    createdAt: iso(l.createdAt),
+  };
+}

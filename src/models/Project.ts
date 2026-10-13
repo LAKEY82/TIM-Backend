@@ -28,6 +28,8 @@ export interface IProject {
   progress: number;
   createdAt: Date;
   updatedAt: Date;
+  designLink?: string | null;
+  githubLink?: string | null;
 }
 
 const projectSchema = new Schema<IProject>(
@@ -51,6 +53,9 @@ const projectSchema = new Schema<IProject>(
     taskCount: { type: Number, default: 0 },
     completedTaskCount: { type: Number, default: 0 },
     progress: { type: Number, default: 0, min: 0, max: 100 },
+    designLink: { type: String, trim: true, maxlength: 1000, default: null },
+    githubLink: { type: String, trim: true, maxlength: 1000, default: null },
+
   },
   { timestamps: true },
 );

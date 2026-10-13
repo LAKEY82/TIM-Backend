@@ -76,5 +76,9 @@ export const NOTIFICATION_TYPES = [
 ] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 
+/** What a project link points to, from its URL: Figma designs, GitHub code, or anything else. */
+export const PROJECT_LINK_KINDS = ["FIGMA", "GITHUB", "OTHER"] as const;
+export type ProjectLinkKind = (typeof PROJECT_LINK_KINDS)[number];
+
 export const MEETING_PLATFORMS = ["ZOOM", "GOOGLE_MEET", "TEAMS", "OTHER"] as const;
 export type MeetingPlatform = (typeof MEETING_PLATFORMS)[number];

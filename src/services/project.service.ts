@@ -1,6 +1,6 @@
 import { Types, type QueryFilter } from "mongoose";
 import type { z } from "zod";
-import { Client, Comment, DailyTask, Department, FileModel, Milestone, Notification, Project, Task, User, type IProject } from "../models";
+import { Client, Comment, DailyTask, Department, FileModel, Milestone, Notification, Project, ProjectLink, Task, User, type IProject } from "../models";
 import { DONE_STATUSES, PRIORITY_RANK, type WorkflowStage } from "../types/domain";
 import type { AuthUser } from "../types/express";
 import { conflict, notFound, unprocessable } from "../utils/errors";
@@ -104,6 +104,8 @@ export async function createProject(actor: AuthUser, input: z.output<typeof crea
     priority: input.priority,
     startDate: input.startDate ?? null,
     deadline: input.deadline ?? null,
+    designLink: input.designLink ?? null,
+    githubLink: input.githubLink ?? null,
     manager: managerId,
     qa: input.qaId,
     members: [...new Set(input.memberIds)].map(oid),
@@ -265,6 +267,8 @@ export async function updateProject(actor: AuthUser, id: string, input: z.output
   if (input.priority !== undefined) project.priority = input.priority;
   if (input.startDate !== undefined) project.startDate = input.startDate;
   if (input.deadline !== undefined) project.deadline = input.deadline;
+  if (input.designLink !== undefined) project.designLink = input.designLink;
+if (input.githubLink !== undefined) project.githubLink = input.githubLink;
   if (input.managerId !== undefined) project.manager = input.managerId ? oid(input.managerId) : null;
   const previousQa = project.qa ? String(project.qa) : null;
   if (input.qaId !== undefined) project.qa = oid(input.qaId);
@@ -347,6 +351,7 @@ export async function deleteProject(actor: AuthUser, id: string) {
   await Promise.all([
     Task.deleteMany({ project: project._id }),
     Milestone.deleteMany({ project: project._id }),
+    ProjectLink.deleteMany({ project: project._id }),
     Comment.deleteMany({ entityId: { $in: owned } }),
     DailyTask.deleteMany({ task: { $in: taskIds } }),
     Notification.deleteMany({ entityId: { $in: owned } }),

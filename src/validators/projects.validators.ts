@@ -25,6 +25,8 @@ const projectFields = {
   status: z.enum(PROJECT_STATUSES),
   priority: z.enum(PRIORITIES),
   startDate: dateInput,
+  designLink: z.string().trim().max(1000).nullable().default(null),
+  githubLink: z.string().trim().max(1000).nullable().default(null),
   deadline: dateInput,
   managerId: objectId.nullable().optional(),
   qaId: objectId,
