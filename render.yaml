@@ -1,0 +1,39 @@
+# Render Blueprint: free web service for the TIM API. See README §9.
+# Values marked `sync: false` are asked for when the Blueprint is first created.
+services:
+  - type: web
+    name: tim-backend
+    runtime: node
+    plan: free
+    branch: main
+    autoDeploy: true
+    # --include=dev: TypeScript is a dev dependency and NODE_ENV=production would skip it.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"
+      - key: ENABLE_JOBS
+        value: "true"
+      # The in-memory MongoDB used by tests isn't needed here; skip its binary download.
+      - key: MONGOMS_DISABLE_POSTINSTALL
+        value: "1"
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: tim
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      # Frontend origin(s), comma-separated, e.g. https://tim.vercel.app
+      - key: CLIENT_URL
+        sync: false
+      # This service's own URL, e.g. https://tim-backend.onrender.com
+      - key: API_PUBLIC_URL
+        sync: false
